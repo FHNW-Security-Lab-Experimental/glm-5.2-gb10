@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Sparks GLM-5.2 watchdog every minute
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=1min
+AccuracySec=5s
+Persistent=true
+Unit=sparks-glm52-watchdog.service
+
+[Install]
+WantedBy=timers.target

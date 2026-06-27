@@ -157,3 +157,26 @@ all-to-all gather of the selected KV + the fp8 LSE combine. With that, 1M fits a
 upstream/research-grade work (the correctness-critical piece is the distributed
 top-k; cf. vLLM RFC #30055). Until then, **512k is the production ceiling**
 (≤~656k single-stream via util, quality-neutral).
+
+## Update 2026-06-27 (b) — NVFP4 MoE illegal-memory-access + watchdog
+
+The `FLASHINFER_CUTLASS` NVFP4 MoE kernel (TensorRT-LLM `cutlass_fused_moe` →
+`cudaMemsetAsync(final_output…)`) can **intermittently** hit a CUDA illegal memory
+access that kills EngineCore (seen after hours of uptime, incl. surviving the 300k
+needle, then a shape/concurrency edge tripped it). The container stays `Up`
+(entrypoint `sleep infinity`) but `vllm serve` exits → `/health` dies.
+
+**Note:** you can NOT force a different NVFP4 MoE kernel with the global
+`--moe-backend marlin` — that flag is global and GLM's **unquantized MTP MoE**
+rejects it (`ValueError: moe_backend='marlin' is not supported for unquantized
+MoE`). A targeted NVFP4-only backend swap (patch `fused_moe/oracle/nvfp4.py`'s
+`AVAILABLE_BACKENDS` to drop the FlashInfer entries → VLLM_CUTLASS/MARLIN) is the
+deeper root-fix, but is unvalidated; pursue only if the IMA recurs often.
+
+**Mitigation in place: `sparks-glm52-watchdog`** (`tools/watchdog_glm52_cluster.sh`
++ `tools/systemd/sparks-glm52-watchdog.{service,timer}`). Every 60s it restarts
+GLM **only** when `/health` is dead AND the in-container `vllm serve` process is
+gone (true engine death — never during a slow long-context prefill, which keeps the
+process alive). Two consecutive dead checks required; shares `restart.lock` (flock)
+with manual launches. The stale `sparks-vllm-watchdog` / `sparks-kimi-watchdog`
+timers are disabled so they cannot fight GLM.

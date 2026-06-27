@@ -1,0 +1,15 @@
+[Unit]
+Description=Sparks GLM-5.2-NVFP4 vLLM health watchdog
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=blacksheeep
+# Restarts GLM-5.2 only when /health is dead AND the in-container `vllm serve`
+# process is gone (true engine death — e.g. the intermittent NVFP4 MoE
+# FlashInfer-CUTLASS cudaMemsetAsync illegal-memory-access that killed EngineCore
+# on 2026-06-27). A slow long-context prefill keeps the serve process alive, so it
+# is never restarted mid-prefill. Requires two consecutive dead checks; shares
+# restart.lock (flock) with manual launches.
+ExecStart=/home/blacksheeep/vllm-glm52/runtime/watchdog_glm52_cluster.sh
