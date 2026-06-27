@@ -8,6 +8,38 @@ sm_121-specific bugs (see `docs/retrospective.md`).
 The 15% expert prune is data-free and coherence-checked, **not** benchmarked.
 Treat quality as unverified.
 
+---
+
+## This fork — full `nvidia/GLM-5.2-NVFP4` on all 8 nodes (FHNW Security Lab)
+
+This fork adds **[`8node-nvfp4/`](8node-nvfp4/)**: the upstream recipe adapted to serve
+the **full model — [`nvidia/GLM-5.2-NVFP4`](https://huggingface.co/nvidia/GLM-5.2-NVFP4)**
+(465 GB, no prune) — across **8× DGX Spark GB10 at TP=8**, served as `glm-5.2-nvfp4`.
+
+Differences vs the upstream 4-node / AWQ-15%-pruned recipe (described below):
+
+- **Full NVFP4 model, no prune** — fits 8 nodes (~58 GB weights/node, TP=8).
+- **In-checkpoint MTP** — the nvidia export ships the layer-78 nextn draft, so MTP runs
+  via `--speculative-config '{"method":"mtp",...}'` against the served model itself (no
+  separate reconstructed draft).
+- **512k context** — a runtime patch reroutes GB10 decode to `top_k_per_row_decode`,
+  fixing the `persistent_topk` cooperative-grid / 99 KB-smem limit that crashes the engine
+  past ~397k `max_model_len` (the upstream tops out at 256k).
+- **MARLIN NVFP4 MoE** — the default FlashInfer-CUTLASS NVFP4 MoE intermittently
+  CUDA-illegal-memory-access-crashes on sm_121; an NVFP4-only oracle patch forces MARLIN
+  (w4a16, stable + correct), with a watchdog backstop.
+- **Measured:** ~22.5 tok/s decode, MTP ~2.8 accepted tokens/step, a 300k-token needle
+  retrieved correctly, survives concurrent load (67 reqs / 0 errors / 0 crashes).
+
+Full runbook: **[`8node-nvfp4/README.md`](8node-nvfp4/README.md)**. Complete writeup
+(build, every fix + why, 1M verdict): **[`8node-nvfp4/CUTOVER-2026-06-27.md`](8node-nvfp4/CUTOVER-2026-06-27.md)**.
+512k is the production ceiling; true 1M needs a sparse-aware context-parallel KV
+(vLLM's DCP is incompatible with DSA sparse) — see the writeup.
+
+The original upstream 4-node recipe follows.
+
+---
+
 ## Requirements
 
 4× GB10 / DGX Spark (sm_121, aarch64), a node-to-node RoCE fabric, and ~400 GB of
