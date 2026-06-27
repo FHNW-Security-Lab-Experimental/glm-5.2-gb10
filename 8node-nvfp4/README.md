@@ -180,3 +180,33 @@ gone (true engine death — never during a slow long-context prefill, which keep
 process alive). Two consecutive dead checks required; shares `restart.lock` (flock)
 with manual launches. The stale `sparks-vllm-watchdog` / `sparks-kimi-watchdog`
 timers are disabled so they cannot fight GLM.
+
+## Update 2026-06-27 (c) — NVFP4 MoE root-fix: force MARLIN (VALIDATED)
+
+The intermittent FlashInfer-CUTLASS IMA is now **root-fixed** (the watchdog from (b)
+is kept only as a backstop). `glm52-sparse-patches.sh` **STEP C** (sentinel
+`# GLM52_NVFP4_MOE_BACKEND`) edits **only** `fused_moe/oracle/nvfp4.py`: on
+capability-family 120 it strips the FlashInfer backends **and** `VLLM_CUTLASS` from
+`AVAILABLE_BACKENDS` so the NVFP4 MoE auto-selects **MARLIN**. The unquantized
+in-checkpoint MTP MoE (`oracle/unquantized.py`) is untouched — which is why this
+surgical patch works where the global `--moe-backend marlin` flag fails.
+
+Why MARLIN (not VLLM_CUTLASS): VLLM_CUTLASS shares the **same broken SM120
+block-scaled grouped-GEMM** as FlashInfer → ~5 tok/s **garbage**. MARLIN is **w4a16**
+(dequantizes the NVFP4 weights in-GEMM with bf16 activations) — a different codepath
+that never touches the broken FP4 grouped-GEMM, and it discards activation scales by
+design so the NVFP4 global-scale-factor concern is moot. vLLM itself already falls
+MXFP8 MoE back to Marlin on sm_121.
+
+**Validated 2026-06-27:** `Using 'MARLIN' NvFp4 MoE backend → ['MARLIN','EMULATION']`;
+coherent + correct output (reasoning/code/instruction, temp 0 — NOT garbage);
+**~22.5 tok/s decode (no regression)**; KV pool 601,600 tokens (512k fits, 1.15×).
+
+**Memory note:** MARLIN's w4a16 weights are slightly larger, so 512k needs
+**`GPU_MEMORY_UTILIZATION=0.78`** (at 0.72 the KV pool was ~0.7 GiB short of the
+26.72 GiB one 512k seq needs — clean `ValueError` at init, no wedge). 0.78 gives
+32.89 GiB KV. Production config is therefore:
+```bash
+CONFIRM_GLM52=YES ENFORCE_EAGER=1 MAX_MODEL_LEN=524288 MAX_NUM_SEQS=4 \
+  GPU_MEMORY_UTILIZATION=0.78 ~/vllm-glm52/runtime/launch.sh
+```

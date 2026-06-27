@@ -366,4 +366,99 @@ echo "   wrote $B12X_ENV_OUT"
 # fused_indexer score-mode patch INTENTIONALLY OMITTED (see header). NSA_RELU_SUM
 # / TOKEN_LOGITS is the target if you wire b12x.attention.indexer later.
 
+# ===========================================================================
+# STEP C — glm52-nvfp4-moe-backend  (NVFP4-only: force MARLIN on sm_12x/GB10)
+# The FLASHINFER_CUTLASS NvFP4 MoE routes into TRT-LLM cutlass_fused_moe and
+# intermittently raises a CUDA IMA in cudaMemsetAsync(final_output) (CUTLASS
+# #2906/#3096) -> kills EngineCore. VLLM_CUTLASS shares the SAME broken SM120
+# block-scaled grouped-GEMM templates -> ~5 tok/s GARBAGE. Strip BOTH from the
+# NvFP4 auto-select list on capability-family 120 so it lands on MARLIN (w4a16:
+# dequantizes the FP4 weights in-GEMM with bf16 activations, never touches the
+# broken FP4 grouped-GEMM; correct + stable on consumer Blackwell; vLLM already
+# falls MXFP8 MoE back to Marlin on sm_121). Touches ONLY oracle/nvfp4.py -> the
+# unquantized in-checkpoint MTP MoE (oracle/unquantized.py) is unaffected (that
+# is why the global `--moe-backend marlin` flag fails and this surgical edit
+# works). Idempotent (sentinel GLM52_NVFP4_MOE_BACKEND), FATAL on missing anchor.
+# ===========================================================================
+NVFP4_ORACLE="$VLLM/model_executor/layers/fused_moe/oracle/nvfp4.py"
+NVFP4_ORACLE="$NVFP4_ORACLE" python3 - <<'PYEOF'
+import io, os, sys
+SENTINEL = "# GLM52_NVFP4_MOE_BACKEND"
+path = os.environ["NVFP4_ORACLE"]
+with io.open(path, "r", encoding="utf-8") as f:
+    src = f.read()
+if SENTINEL in src:
+    print("   nvfp4.py already patched (GLM52_NVFP4_MOE_BACKEND) — skipping")
+    sys.exit(0)
+
+anchor = (
+    '    """\n'
+    '    Select the primary NvFP4 MoE backend\n'
+    '    Note: Shape-specific fallbacks may still occur at runtime.\n'
+    '    """\n'
+    '\n'
+    '    # NOTE: the kernels are selected in the following order.\n'
+)
+if anchor not in src:
+    print("   FATAL: select_nvfp4_moe_backend docstring anchor not found — "
+          "source differs from ab66606; aborting.", file=sys.stderr)
+    sys.exit(3)
+inject = (
+    '    """\n'
+    '    Select the primary NvFP4 MoE backend\n'
+    '    Note: Shape-specific fallbacks may still occur at runtime.\n'
+    '    """\n'
+    '\n'
+    '    ' + SENTINEL + ': on sm_12x (GB10, capability family 120) BOTH the\n'
+    '    # FlashInfer NvFP4 MoE path (TRT-LLM cutlass_fused_moe -> intermittent\n'
+    '    # CUDA IMA in cudaMemsetAsync(final_output)) AND the in-tree VLLM_CUTLASS\n'
+    '    # path (same broken SM120 grouped-GEMM -> garbage) are unsafe. Strip them\n'
+    '    # from auto-selection so the NvFP4 MoE lands on MARLIN. Auto-select only;\n'
+    '    # an explicit moe_backend= request is honored unchanged.\n'
+    '    from vllm.platforms import current_platform as _glm52_cp\n'
+    '    _glm52_strip_unsafe_fam120 = (\n'
+    '        config.moe_backend == "auto"\n'
+    '        and _glm52_cp.is_cuda()\n'
+    '        and _glm52_cp.is_device_capability_family(120)\n'
+    '    )\n'
+    '\n'
+    '    # NOTE: the kernels are selected in the following order.\n'
+)
+src = src.replace(anchor, inject, 1)
+
+list_anchor = (
+    '        NvFp4MoeBackend.EMULATION,\n'
+    '    ]\n'
+    '\n'
+    '    NVFP4_BACKENDS_WITH_CLAMP = {\n'
+)
+if list_anchor not in src:
+    print("   FATAL: AVAILABLE_BACKENDS list-end anchor not found — aborting.",
+          file=sys.stderr)
+    sys.exit(4)
+list_inject = (
+    '        NvFp4MoeBackend.EMULATION,\n'
+    '    ]\n'
+    '\n'
+    '    if _glm52_strip_unsafe_fam120:\n'
+    '        _glm52_unsafe = set(FLASHINFER_NVFP4_MOE_BACKENDS) | {\n'
+    '            NvFp4MoeBackend.VLLM_CUTLASS,\n'
+    '        }\n'
+    '        AVAILABLE_BACKENDS = [\n'
+    '            b for b in AVAILABLE_BACKENDS if b not in _glm52_unsafe\n'
+    '        ]\n'
+    '\n'
+    '    NVFP4_BACKENDS_WITH_CLAMP = {\n'
+)
+src = src.replace(list_anchor, list_inject, 1)
+
+tmp = path + ".glm52c.tmp"
+with io.open(tmp, "w", encoding="utf-8") as f:
+    f.write(src)
+os.replace(tmp, path)
+import py_compile
+py_compile.compile(path, doraise=True)
+print("   nvfp4.py patched: FLASHINFER_* + VLLM_CUTLASS stripped on fam120 -> MARLIN; py_compile OK")
+PYEOF
+
 echo "== glm52-runtime-patch: done"
