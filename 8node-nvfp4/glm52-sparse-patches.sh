@@ -274,6 +274,52 @@ for p in (dg_path, ix_path):
 print("   py_compile OK for both patched files")
 PYEOF
 
+# ---------------------------------------------------------------------------
+# Step A4 — route sm_12x (GB10) DECODE top-k off persistent_topk.
+# STANDALONE + sentinel-guarded (NOT nested in A2/A3, whose sentinel may already
+# be present). On GB10 the DSA decode indexer calls torch.ops._C.persistent_topk
+# over a logits row of width stride=max_model_len; once max_model_len pushes
+# total_ctas=ceil(max_model_len/8472) past num_sms*occupancy=48 (i.e. ~>397k:
+# 31@256k ok, 62@512k, 124@1M) the cooperative path "would oversubscribe" and the
+# FilteredTopK fallback needs >=128KB smem vs GB10's 99KB -> RuntimeError, killing
+# decode at 512k/1M. The in-tree `else` branch (ops.top_k_per_row_decode) is the
+# set-equivalent radix top-k: one block/row, ~8KB smem, no SM/smem wall. We only
+# stop cap-family 120 from taking the persistent path.
+# ---------------------------------------------------------------------------
+INDEXER="$INDEXER" python3 - <<'PYEOF'
+import io, os, sys
+SENT = "# GLM52_SM12X_DECODE_REROUTE"
+ix = os.environ["INDEXER"]
+with io.open(ix, "r", encoding="utf-8") as f:
+    s = f.read()
+anchor = "        if current_platform.is_cuda() and topk_tokens in (512, 1024, 2048):\n"
+if SENT in s:
+    print("   A4: sm_12x decode reroute already applied — skipping")
+elif anchor not in s:
+    print("   FATAL A4: persistent_topk decode gate anchor not found in "
+          "sparse_attn_indexer.py — source differs from ab66606; aborting.",
+          file=sys.stderr)
+    sys.exit(8)
+else:
+    new = (
+        "        " + SENT + " (GB10 cap-family 120 cannot run persistent_topk at\n"
+        "        # long context; take the set-equivalent top_k_per_row_decode else-branch)\n"
+        "        if (\n"
+        "            current_platform.is_cuda()\n"
+        "            and topk_tokens in (512, 1024, 2048)\n"
+        "            and not current_platform.is_device_capability_family(120)\n"
+        "        ):\n"
+    )
+    s = s.replace(anchor, new, 1)
+    tmp = ix + ".glm52a4.tmp"
+    with io.open(tmp, "w", encoding="utf-8") as f:
+        f.write(s)
+    os.replace(tmp, ix)
+    import py_compile
+    py_compile.compile(ix, doraise=True)
+    print("   A4: routed sm_12x decode to top_k_per_row_decode; py_compile OK")
+PYEOF
+
 echo "== glm52-sm12x-sparse: done"
 
 # ===========================================================================

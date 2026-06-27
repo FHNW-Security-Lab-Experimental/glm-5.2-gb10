@@ -114,3 +114,30 @@ Kernels and the overall recipe: **CosmicRaisins/glm-5.2-gb10** (Apache-2.0), its
 building on jasl's V4 sparse-MLA, the eugr/spark-vllm-docker image, and Z.ai's
 GLM-5.2. This directory adapts it to the full NVFP4 model on 8 nodes with the
 in-checkpoint MTP draft. See `KERNELS-LICENSE`.
+
+## Update 2026-06-27 — 512k context unlocked (persistent_topk fix)
+
+The DSA **decode** indexer crashed at configured `max_model_len > ~397k` in
+`torch.ops._C.persistent_topk` (`topk.cu`): on GB10 it needs `total_ctas =
+ceil(max_model_len/8472)` cooperative CTAs (31@256k, **62@512k, 124@1M**) >
+`num_sms*occupancy=48`, and the `FilteredTopK` fallback needs ≥128 KB smem vs
+sm_121's 99 KB → `RuntimeError`, killing the engine. It's gated by **configured
+max_model_len (stride), not prompt length** (so 256k was always fine).
+
+**Fix (runtime, in `glm52-sparse-patches.sh` Step A4 — standalone, sentinel
+`# GLM52_SM12X_DECODE_REROUTE`):** add `and not
+current_platform.is_device_capability_family(120)` to the decode gate in
+`sparse_attn_indexer.py`, so GB10 takes the in-tree `else` →
+`ops.top_k_per_row_decode` (set-equivalent top-k, 8 KB smem, one block/row, no
+SM/smem wall). **Validated at 512k**: decode works, 0 `persistent_topk` errors,
+~22.5 tok/s (no regression), and a **300,040-token needle retrieved correctly**.
+
+**512k is the safe production ceiling.** `MAX_MODEL_LEN=524288 MAX_NUM_SEQS=1
+GPU_MEMORY_UTILIZATION=0.78` fits comfortably.
+
+**1M is memory-bound, not kernel-bound.** Per node at TP=8: ~58 GB weights + ~44 GB
+fp8_ds_mla KV (replicated per rank) + ~10 GB indexer ≈ **112 GB floor on a 121 GB
+node** → needs gpu-util ~0.95 = the documented OOM-wedge recipe. The real lever is
+**decode-context-parallel (`--decode-context-parallel-size 8`)** to shard the MLA
+KV (~44 → ~5.5 GB/node); that — not a kernel change — is the path to 1M (untested
+with MTP+sparse on GB10; treat as a supervised experiment).
