@@ -101,12 +101,8 @@ Serves OpenAI-compatible on `192.168.88.101:8000` as `glm-5.2-nvfp4`.
 
 ## Context: 512k / 1M
 
-- **512k single-stream** is the safe long-context ceiling:
-  `CONFIRM_GLM52=YES MAX_MODEL_LEN=524288 MAX_NUM_SEQS=1 GPU_MEMORY_UTILIZATION=0.85
-  ALLOW_HIGH_GPU_UTIL=YES ~/vllm-glm52/runtime/launch.sh` (coherence-soak first).
-- **1M** (`MAX_MODEL_LEN=1048576`) needs gmu ~0.90 and is experimental — collides
-  with the GB10 unified-mem OOM-at-load wedge; attempt supervised with Shelly
-  power-cycle recovery armed.
+See **"Update 2026-06-27"** below for the validated 512k production config and the
+1M feasibility verdict (this section's earlier pre-fix guidance was superseded).
 
 ## Attribution
 
@@ -132,12 +128,32 @@ current_platform.is_device_capability_family(120)` to the decode gate in
 SM/smem wall). **Validated at 512k**: decode works, 0 `persistent_topk` errors,
 ~22.5 tok/s (no regression), and a **300,040-token needle retrieved correctly**.
 
-**512k is the safe production ceiling.** `MAX_MODEL_LEN=524288 MAX_NUM_SEQS=1
-GPU_MEMORY_UTILIZATION=0.78` fits comfortably.
+**512k is the safe production ceiling.** Validated, serving config:
+```bash
+CONFIRM_GLM52=YES MAX_MODEL_LEN=524288 MAX_NUM_SEQS=4 GPU_MEMORY_UTILIZATION=0.78 \
+  ENFORCE_EAGER=1 ~/vllm-glm52/runtime/launch.sh
+```
+No `ALLOW_HIGH_GPU_UTIL` needed — the topk fix makes 512k fit at the safe 0.78 util.
+KV pool ≈ **601k tokens** shared across the 4 slots (one full-512k stream, or 4
+concurrent shorter requests; typical AnythingLLM turns leave large headroom).
+~656k is reachable single-stream at util 0.85 with **no quality change** (it's just
+more memory, soak-test vs the wedge). fp8_ds_mla KV throughout — no MXFP4.
 
-**1M is memory-bound, not kernel-bound.** Per node at TP=8: ~58 GB weights + ~44 GB
-fp8_ds_mla KV (replicated per rank) + ~10 GB indexer ≈ **112 GB floor on a 121 GB
-node** → needs gpu-util ~0.95 = the documented OOM-wedge recipe. The real lever is
-**decode-context-parallel (`--decode-context-parallel-size 8`)** to shard the MLA
-KV (~44 → ~5.5 GB/node); that — not a kernel change — is the path to 1M (untested
-with MTP+sparse on GB10; treat as a supervised experiment).
+**1M is a SOFTWARE limit, not hardware — and NOT reachable via vLLM's DCP.** The
+cluster physically has the memory (8×121 = 968 GiB; 1M needs ~555 GiB *with sharded
+KV*), but vLLM **replicates** the MLA KV on all 8 ranks (~50 GiB/node at 1M) because
+MLA's single KV head can't be TP-sharded — that 8× duplication overflows a 121 GiB
+node, not a real shortage. vLLM's `--decode-context-parallel-size` (DCP) is a **dead
+end here, verified 3 ways in the live container**: (1) DCP hard-refuses fp8 KV
+(`mla_attention.py:788 assert not fp8_attention`); (2) the DSA indexer has **no
+cross-rank top-k**, so sharding the context makes each rank pick top-2048 of its own
+1/8 → silently wrong attention; (3) sparse `forward_mqa` returns `None` for the
+softmax LSE DCP requires. **Do not use `--decode-context-parallel-size`.**
+
+True 1M needs a **sparse-aware context-parallel KV** implementation: shard the
+fp8_ds_mla KV + a distributed indexer doing a global cross-rank top-2048 + an
+all-to-all gather of the selected KV + the fp8 LSE combine. With that, 1M fits at a
+**safe ~0.66 util keeping fp8 (no quality loss)** — but it is ~weeks of
+upstream/research-grade work (the correctness-critical piece is the distributed
+top-k; cf. vLLM RFC #30055). Until then, **512k is the production ceiling**
+(≤~656k single-stream via util, quality-neutral).
