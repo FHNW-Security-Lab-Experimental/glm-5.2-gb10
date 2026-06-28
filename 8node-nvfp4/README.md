@@ -5,8 +5,8 @@ lightning indexer + 256-expert MoE) across **all 8 GB10 nodes** at **TP=8**, wit
 **native sm_121 DSA sparse attention**, **in-checkpoint MTP speculative decode**, and
 the **MARLIN** NVFP4 MoE backend. Served as `glm-5.2-nvfp4` on the head `:8000`.
 
-> **Three serving configs** — non-DCP 512k (production, ~22.5 tok/s), DCP 512k (~20 tok/s),
-> and **DCP true-1M context** (~17–18 tok/s) — share one launcher
+> **Three serving configs** — non-DCP 512k (production, ~22.5 tok/s), DCP 512k (~22–23 tok/s),
+> and **DCP true-1M context** (~18–19 tok/s, PERF#2 local-top-2048 decode) — share one launcher
 > `start_glm52_config.sh {prod|dcp-512k|dcp-1m}`. The DCP path (sparse-aware context-parallel
 > KV: shard the MLA KV across ranks + a distributed global top-2048) is what unlocks 1M. See
 > **[`CONFIGS.md`](CONFIGS.md)** for the table, when to use which, and the prefill caveat; the
@@ -26,7 +26,7 @@ dcp-512k 8, dcp-1m 4) limits the scheduled batch and is raisable while the pool 
 | 256k | 2  | 18  | 16  |
 | 512k | **1** | **9** | 8 |
 | 1M   | — (max 512k) | — (max 512k) | **4** |
-| decode tok/s (per stream) | ~22.5 | ~20–21 | ~17–18 |
+| decode tok/s (per stream) | ~22.5 | ~22–23 | ~18–19 |
 
 ¹ KV pool 601,856 tok, cap 4 — replicated, so only ~1 full-512k context fits; 4 slots are real only
 for shorter/mixed requests (combined ≤ ~600k tok). ² pool 4,829,184 tok, cap 8. ³ pool 4,323,328 tok,

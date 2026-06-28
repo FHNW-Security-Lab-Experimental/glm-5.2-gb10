@@ -11,13 +11,17 @@
 #   ./build-dcp-patch.sh --stage         # build + scp to all 8 nodes + refresh ~/glm-triton-dcp
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-OUT="$HERE/glm52-sparse-patches-dcp.sh"
+# OUT + DCP_SRC are overridable so the PERF#2 variant builds from its own source into
+# its own file without touching the production combined patch:
+#   DCP_SRC=glm52-dcp-patches-perf2.sh OUT=glm52-sparse-patches-dcp-perf2.sh ./build-dcp-patch.sh
+OUT="${OUT:-$HERE/glm52-sparse-patches-dcp.sh}"
+DCP_SRC="${DCP_SRC:-$HERE/glm52-dcp-patches.sh}"
 
 cp "$HERE/glm52-sparse-patches.sh" "$OUT"
 {
   echo ""
-  echo "# ===== appended by build-dcp-patch.sh: glm52-dcp-patches.sh STEP A+B+C (CONFIRM gate stripped) ====="
-  sed -n '/^PYDIST=/,$p' "$HERE/glm52-dcp-patches.sh"
+  echo "# ===== appended by build-dcp-patch.sh: ${DCP_SRC##*/} STEP A+B+C (CONFIRM gate stripped) ====="
+  sed -n '/^PYDIST=/,$p' "$DCP_SRC"
 } >> "$OUT"
 chmod +x "$OUT"
 bash -n "$OUT"

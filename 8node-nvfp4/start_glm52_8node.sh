@@ -232,9 +232,15 @@ create_container() {
 
   mkdir -p "$LOG_DIR" "$RUNTIME_DIR"
   local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
-  for old_log in "$LOG_DIR"/glm52-rank*.log; do
-    [[ -f "$old_log" ]] && mv "$old_log" "${old_log%.log}.${stamp}.log"
+  # Rotate ONLY the live per-rank logs (glm52-rank<N>.log), never the already
+  # stamped backups. The old glob (glm52-rank*.log) re-rotated backups on every
+  # boot, so the name grew a stamp each time until `mv` failed with "File name
+  # too long" and — under set -e — aborted the launch, losing the crash log.
+  # Tolerate any mv failure (|| true) and prune to the newest 12 backups.
+  for live_log in "$LOG_DIR"/glm52-rank[0-9].log "$LOG_DIR"/glm52-rank[0-9][0-9].log; do
+    [[ -f "$live_log" ]] && mv "$live_log" "${live_log%.log}.${stamp}.log" 2>/dev/null || true
   done
+  ls -1t "$LOG_DIR"/glm52-rank*.*.log 2>/dev/null | tail -n +13 | xargs -r rm -f 2>/dev/null || true
   [[ -d "$MODEL_HOST_PATH" ]] || { echo "Missing model dir on $(hostname): $MODEL_HOST_PATH" >&2; exit 1; }
   [[ -f "$KERNELS_DIR/sparse_mla_kernels.py" ]] || { echo "Missing Triton kernels on $(hostname): $KERNELS_DIR (run bootstrap step 3)" >&2; exit 1; }
   [[ -f "$PATCH_SCRIPT" ]] || { echo "Missing patch script on $(hostname): $PATCH_SCRIPT" >&2; exit 1; }
@@ -245,6 +251,18 @@ create_container() {
   for old in $STOP_CONTAINERS; do
     [[ "$old" == "$CONTAINER" ]] && continue
     sudo docker stop "$old" >/dev/null 2>&1 || true
+  done
+
+  # `docker rm -f` returns before the driver actually frees the dead container's
+  # unified memory; loading the new 465 GB model while the prior ~70 GB is still
+  # held makes WorkerProc init fail under memory pressure (observed 2026-06-28:
+  # back-to-back config swaps left ~70 GB held → "WorkerProc initialization
+  # failed"). Wait (≤90 s, best-effort) for this node's used memory to fall back
+  # to baseline before starting the new container.
+  for _w in $(seq 1 45); do
+    used_mb="$(free -m | awk '/^Mem:/{print $3}')"
+    if (( used_mb < 16000 )); then break; fi
+    sleep 2
   done
 
   local memcap=()

@@ -44,23 +44,29 @@ a 121 GiB node. The DCP configs shard the KV across the 8 ranks (`--decode-conte
 
 - **A** — allow fp8 KV under DCP (relax the `mla_attention.py` gate; all-gather the bf16 query, keep KV fp8).
 - **B (decode)** — the DSA indexer scores its local KV shard, so each rank picks a *local* top-2048.
-  Fix: all-gather the indexer logits across the DCP group → reassemble to global key order → global
-  top-2048 → write each rank its **owned** subset (`p%8`, local `p//8`, else −1). Plus the sparse
-  decode kernel returns its per-shard softmax LSE so vLLM's `cp_lse_ag_out_rs` recombines correctly.
+  Fix (**PERF#2, production**): each rank takes its LOCAL top-2048, all-gathers only those candidates
+  (a **FIXED-SIZE** `[rows, 8×2048]` exchange, context-independent), unions them, and re-selects the
+  global top-2048 by a strict (score desc, global-pos asc) order → writes each rank its **owned**
+  subset (`p%8`, local `p//8`, else −1). The sparse decode kernel returns its per-shard softmax LSE
+  so vLLM's `cp_lse_ag_out_rs` recombines correctly. **+12% decode** (validated, real tokens) vs the
+  original all-gather-full-logits reassembly, which is preserved as `glm52-dcp-patches-itemb.sh`.
 - **C (prefill)** — same idea for prefill: each rank gathers its KV shard, `all_gatherv` the shard-K,
   reassemble to global per-request key order, run the prefill logits/top-k over the full K, owned-mask.
 
 Empirically: DCP KV pool ≈ **4.3–4.8M tokens** (≈8× the 601k replicated pool) → 1M fits ~4.3×
 over with no OOM. Coherence + 16k needle (3 depths) + 131k needle (3 depths) all pass; the 1M
-config loads and serves coherently at ~17–18 tok/s.
+config loads and serves coherently at **~18–19 tok/s** (PERF#2 decode; +12% over item-B, validated
+real-token: working 15.7/16.9 → perf2 17.7/19.0 at 4k/256k).
 
 ### Caveat — prefill latency at extreme context (DCP only)
 Decode is fast, but **prefill of very long prompts is slow** under DCP: the indexer K all-gather +
 reassembly runs per-chunk-per-layer. ~131k prompts are practical; ~400k+ prefill is impractically
 slow today (a 600k-token prefill exceeded a 30-min client timeout — the engine was healthy, just
-slow). This is an optimization target (cache the reassembly index across layers; lighten the
-collective), **not** a correctness or decode-speed issue. For prompts that fit 512k, `prod` both
-avoids this and is faster.
+slow). The decode optimization is **done** (PERF#2 above). The prefill caching attempt (**PERF#1**:
+cache the reassembly index/gatherv sizes across layers) was a **NO-GO** — it deadlocked the
+multi-chunk prefill in a variable-size all-gatherv (see `PERF-RESULTS.md`); revisit needs per-chunk
+sizing + a gatherv-size-agreement assertion. Prefill slowness is **not** a correctness or
+decode-speed issue. For prompts that fit 512k, `prod` both avoids this and is faster.
 
 ## DCP staging (one-time / after patch edits)
 
