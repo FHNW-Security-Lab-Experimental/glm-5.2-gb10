@@ -5,6 +5,33 @@ lightning indexer + 256-expert MoE) across **all 8 GB10 nodes** at **TP=8**, wit
 **native sm_121 DSA sparse attention**, **in-checkpoint MTP speculative decode**, and
 the **MARLIN** NVFP4 MoE backend. Served as `glm-5.2-nvfp4` on the head `:8000`.
 
+> **Three serving configs** — non-DCP 512k (production, ~22.5 tok/s), DCP 512k (~20 tok/s),
+> and **DCP true-1M context** (~17–18 tok/s) — share one launcher
+> `start_glm52_config.sh {prod|dcp-512k|dcp-1m}`. The DCP path (sparse-aware context-parallel
+> KV: shard the MLA KV across ranks + a distributed global top-2048) is what unlocks 1M. See
+> **[`CONFIGS.md`](CONFIGS.md)** for the table, when to use which, and the prefill caveat; the
+> engineering is in `1M-SPARSE-CP-KV-PLAN.md` / `ITEM-B-SPEC.md` / `PREFILL-ALLGATHER-SPEC.md`.
+
+### Concurrent request slots vs context length × config
+
+How many requests run in parallel = `min(--max-num-seqs, KV-pool ÷ context-per-request)`. The KV
+pool differs by config: non-DCP replicates the MLA KV per rank (small pool); DCP shards it 8-way
+(~8× pool). Values below are **how many fit in the KV pool**; the live `--max-num-seqs` cap (prod 4,
+dcp-512k 8, dcp-1m 4) limits the scheduled batch and is raisable while the pool has room.
+
+| Context / request | `prod` (non-DCP 512k)¹ | `dcp-512k`² | `dcp-1m`³ |
+|---|---|---|---|
+| 32k  | 18 | 147 | 131 |
+| 128k | 4  | 36  | 32  |
+| 256k | 2  | 18  | 16  |
+| 512k | **1** | **9** | 8 |
+| 1M   | — (max 512k) | — (max 512k) | **4** |
+| decode tok/s (per stream) | ~22.5 | ~20–21 | ~17–18 |
+
+¹ KV pool 601,856 tok, cap 4 — replicated, so only ~1 full-512k context fits; 4 slots are real only
+for shorter/mixed requests (combined ≤ ~600k tok). ² pool 4,829,184 tok, cap 8. ³ pool 4,323,328 tok,
+cap 4 — vLLM logs *"Maximum concurrency for 1,048,576 tokens per request: 4.12x"*. Measured 2026-06-28.
+
 Ported from [`CosmicRaisins/glm-5.2-gb10`](https://github.com/CosmicRaisins/glm-5.2-gb10)
 (proven on 4 nodes / TP=4 / AWQ-INT4-15%-pruned + a *separate* INT4 MTP draft); this
 runs the **full NVFP4 model on 8 nodes (no prune)** and uses the **in-checkpoint
@@ -110,6 +137,12 @@ single-stream at util 0.85 with no quality change if needed (soak-test vs the OO
 # image vllm-node-tf5-glm52:base                              loaded on every node
 # nvidia/GLM-5.2-NVFP4 weights -> ~/models/GLM-5.2-NVFP4       on every node
 ```
+
+The three **binary** deps (image, NCCL 2.30.4, b12x wheel) — provenance, pinned sha256s,
+and how to reconstruct/distribute them — are in [`EXTERNAL-DEPS.md`](EXTERNAL-DEPS.md). The
+b12x wheel is vendored at `wheels/`; the NCCL `.so` (248 MB) and image (~19 GB) are not in
+git but are sha-pinned and live on all 8 nodes. All **code** (launcher, patches, kernels,
+watchdog) is committed and verified byte-identical across the 8 nodes (2026-06-28).
 
 ## Launch / operate (from the head)
 

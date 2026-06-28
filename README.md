@@ -1,150 +1,125 @@
-# GLM-5.2 on DGX Spark (GB10, sm_121)
+# GLM-5.2-NVFP4 on 8× DGX Spark (GB10, sm_121)
 
-Serves GLM-5.2 (744B/40B MoE, `GlmMoeDsa`) on a 4-node GB10 cluster at 256k
-context with MTP speculative decode. Getting it running on sm_121 meant porting
-the sparse-MLA attention off the Hopper-only `_flashmla_C` path and fixing several
-sm_121-specific bugs (see `docs/retrospective.md`).
+Run the **full `nvidia/GLM-5.2-NVFP4`** (465 GB, **no prune**) across **8× DGX Spark GB10** at
+**TP=8** — native sm_121 DSA sparse attention, in-checkpoint MTP speculative decode, MARLIN NVFP4
+MoE — from **512k** production up to **true 1M context** via a **sparse-aware context-parallel KV**.
 
-The 15% expert prune is data-free and coherence-checked, **not** benchmarked.
-Treat quality as unverified.
+This is the **8-node, full-model** line of work. The **entire runtime for all three serving configs**
+— every patch, kernel, launcher, the base-image build recipe, the engineering writeups, and the
+reproduction info — lives in **[`8node-nvfp4/`](8node-nvfp4/)**. The original 4-node / AWQ-pruned
+upstream is credited at the bottom.
 
----
+## Three serving configs — one launcher
 
-## This fork — full `nvidia/GLM-5.2-NVFP4` on all 8 nodes (FHNW Security Lab)
+```bash
+8node-nvfp4/start_glm52_config.sh prod        # non-DCP 512k  — fastest, production default
+8node-nvfp4/start_glm52_config.sh dcp-512k    # DCP 512k      — more long-context concurrency
+8node-nvfp4/start_glm52_config.sh dcp-1m      # DCP true 1M context
+```
 
-This fork adds **[`8node-nvfp4/`](8node-nvfp4/)**: the upstream recipe adapted to serve
-the **full model — [`nvidia/GLM-5.2-NVFP4`](https://huggingface.co/nvidia/GLM-5.2-NVFP4)**
-(465 GB, no prune) — across **8× DGX Spark GB10 at TP=8**, served as `glm-5.2-nvfp4`.
+| Config | Context | Decode tok/s¹ | Parallel streams (KV pool) | KV layout |
+|---|---|---|---|---|
+| **`prod`** (non-DCP) | 512k | **~22.5** | ~1 full-512k (4-slot cap) | MLA KV replicated per rank |
+| **`dcp-512k`** | 512k | ~20–21 | **~9 × 512k** (8 slots) | MLA KV sharded 8-way |
+| **`dcp-1m`** | **1,048,576** | ~17–18 | **4 × 1M** (vLLM: 4.12×) | MLA KV sharded 8-way |
 
-Differences vs the upstream 4-node / AWQ-15%-pruned recipe (described below):
+¹ single-stream, warm, GB10, 2026-06-28. Slots ≈ `min(--max-num-seqs, KV-pool ÷ context)`. Full
+table (slots vs context × config), tuning, recovery: **[`8node-nvfp4/CONFIGS.md`](8node-nvfp4/CONFIGS.md)**.
 
-- **Full NVFP4 model, no prune** — fits 8 nodes (~58 GB weights/node, TP=8).
-- **In-checkpoint MTP** — the nvidia export ships the layer-78 nextn draft, so MTP runs
-  via `--speculative-config '{"method":"mtp",...}'` against the served model itself (no
-  separate reconstructed draft).
-- **512k context** — a runtime patch reroutes GB10 decode to `top_k_per_row_decode`,
-  fixing the `persistent_topk` cooperative-grid / 99 KB-smem limit that crashes the engine
-  past ~397k `max_model_len` (the upstream tops out at 256k).
-- **MARLIN NVFP4 MoE** — the default FlashInfer-CUTLASS NVFP4 MoE intermittently
-  CUDA-illegal-memory-access-crashes on sm_121; an NVFP4-only oracle patch forces MARLIN
-  (w4a16, stable + correct), with a watchdog backstop.
-- **Measured:** ~22.5 tok/s decode, MTP ~2.8 accepted tokens/step, a 300k-token needle
-  retrieved correctly, survives concurrent load (67 reqs / 0 errors / 0 crashes).
+Use **`prod`** for anything ≤512k (it's materially faster); use the DCP configs to exceed 512k or for
+far more long-request concurrency (sharding gives ~8× the KV pool).
 
-Full runbook: **[`8node-nvfp4/README.md`](8node-nvfp4/README.md)**. Complete writeup
-(build, every fix + why, 1M verdict): **[`8node-nvfp4/CUTOVER-2026-06-27.md`](8node-nvfp4/CUTOVER-2026-06-27.md)**.
-512k is the production ceiling; true 1M needs a sparse-aware context-parallel KV
-(vLLM's DCP is incompatible with DSA sparse) — see the writeup.
+## What runs
 
-The original upstream 4-node recipe follows.
+| | |
+|---|---|
+| Model | full `nvidia/GLM-5.2-NVFP4` — 465 GB, no prune (~58 GB weights/node) |
+| Hardware | 8× DGX Spark GB10 (sm_121a, **121 GiB unified** mem/node), 200G RoCE fabric |
+| Parallelism | TP=8; **DCP=8** (decode context-parallel) for the sharded-KV configs |
+| Attention | native sm_121 **DSA**: sparse-MLA + lightning indexer (top-2048/query) |
+| Speculative | **in-checkpoint MTP** (the nvidia export's layer-78 nextn head), k=3 |
+| KV / MoE | `fp8_ds_mla` / **MARLIN** NVFP4 (w4a16) |
+| Serving | OpenAI-compatible on the head `:8000` as `glm-5.2-nvfp4` |
 
----
+## Highlights — what was solved on 8× GB10
 
-## Requirements
+- **Full NVFP4 on all 8 nodes, no prune** — the entire 465 GB model at TP=8 (not a reduced/pruned variant).
+- **Native DSA sparse on sm_121** — ported Triton sparse-MLA + lightning indexer off the Hopper-only
+  `_flashmla_C` path, with a DeepGEMM arch-gate bypass.
+- **In-checkpoint MTP** — ~2.8 accepted tokens/step → ~22.5 tok/s (≈4.6× the old PP=8 dense baseline).
+- **512k** — fixed the GB10 `persistent_topk` cooperative-grid / 99 KB-smem limit (reroute decode to
+  `top_k_per_row_decode`); validated with a 300k-token needle.
+- **NVFP4 MoE crash root-fixed** — FlashInfer-CUTLASS illegal-memory-access eliminated by forcing
+  **MARLIN** (NVFP4-oracle patch), with a watchdog backstop.
+- **TRUE 1M context** — a **sparse-aware context-parallel KV**: shard the MLA latent KV across the 8
+  ranks (DCP), a **distributed global top-2048** for the DSA indexer (decode *and* prefill), and a
+  per-shard softmax-LSE recombine. Memory closes (KV pool ~4.3M tokens, ~4.3× a full 1M) and the model
+  serves **4 parallel 1M streams** coherently. Needles pass at 16k/131k across depths.
 
-4× GB10 / DGX Spark (sm_121, aarch64), a node-to-node RoCE fabric, and ~400 GB of
-weights reachable from every node. Not portable to single-GPU, x86, or datacenter
-Blackwell (sm_100).
+## How the 1M unlock works (sparse-aware context-parallel KV)
 
-## Run
+vLLM replicates the MLA latent KV on every TP rank (MLA has one KV head), so 1M overflows a 121 GiB
+node. The DCP configs shard it across ranks — but stock DCP is incompatible with the DSA sparse path,
+so three in-container patches (`8node-nvfp4/glm52-dcp-patches.sh`, applied after the base
+`glm52-sparse-patches.sh`) make it correct:
 
-Edit the CONFIG block in `bootstrap.sh` (node IPs, weights location, HF repo ids),
-then run it from the head node. It verifies the cluster, builds the pinned vLLM
-image, deploys the Triton kernels, installs NCCL 2.30.4, fetches the weights to
-every node, and launches via `launch.sh`. Serves an OpenAI-compatible API on
-`:8210` as `glm-5.2-15pct`.
+- **A** — allow fp8 KV under DCP (relax the gate; all-gather the bf16 query, keep KV fp8).
+- **B (decode)** — each rank scores only its KV shard, so it would pick a *local* top-2048. Fix:
+  all-gather the indexer logits → reassemble to global order → global top-2048 → each rank keeps its
+  *owned* subset (`p%8`, local `p//8`, else −1); the sparse decode kernel returns its per-shard LSE so
+  vLLM's `cp_lse_ag_out_rs` recombines exactly.
+- **C (prefill)** — same for prefill: gather each rank's KV shard, `all_gatherv` it, reassemble to
+  global per-request key order, run the prefill logits/top-k over the full key set, owned-mask.
 
-**Launch is a plain `docker run`.** `launch.sh` starts the container on each node
-directly — no Ray, no shared filesystem, no external harness. Multi-node is vLLM's
-own mechanism (`--nnodes/--node-rank/--master-addr/--master-port`): workers come up
-headless, then the head serves the API. You can run it on its own once the image,
-kernels, and weights are in place; edit its CONFIG block (it mirrors `bootstrap.sh`)
-and preview the exact commands with `./launch.sh --dry-run`. Stop with `./launch.sh --stop`.
+Engineering writeups (in `8node-nvfp4/`): `1M-SPARSE-CP-KV-PLAN.md`, `ITEM-B-SPEC.md`,
+`PREFILL-ALLGATHER-SPEC.md`, `ITEM-B-DESIGN.md`, `CUTOVER-2026-06-27.md`, `DECODE-RESEARCH-2026-06-27.md`.
+Offline validators: `validate_dcp_reassembly.py`, `validate_lse_recombine.py`; endpoint validator:
+`validate_dcp.py`.
 
-Weights just need to be present on each node under the configured directory
-(`$WEIGHTS_DIR/hub/...`). `bootstrap.sh` fetches a per-node copy; if you have a
-shared mount, point `WEIGHTS_DIR` at it instead. Nothing requires NFS.
+## Quickstart (from the head)
 
-The image build is not self-contained — it requires two `spark-vllm-docker` mods
-that are not vendored here. See **Image build** below before running `bootstrap.sh`.
+```bash
+# 1) stage runtime to all 8 nodes (image, NCCL 2.30.4, kernels, b12x, patches, model) — see 8node-nvfp4/README.md
+#    DCP configs also need: 8node-nvfp4/build-dcp-patch.sh --stage   (builds + stages the combined patch + DCP kernels)
+# 2) launch any config:
+~/vllm-glm52/runtime/start_glm52_config.sh dcp-1m            # or prod / dcp-512k
+curl -s http://192.168.88.101:8000/v1/models                 # served as glm-5.2-nvfp4
+# 3) validate (sparse attention can corrupt silently — never trust /health alone):
+8node-nvfp4/validate_dcp.py --base http://192.168.88.101:8000/v1 --model glm-5.2-nvfp4 \
+  --needle-tokens 131072 --depths 0.1,0.5,0.9
+```
 
-`launch.sh` (and the reference `recipes/glm52-awq-15pct-prod.yaml`) carry RoCE
-fabric values (HCA + interface names) hardcoded to my cluster — set those for
-yours. The lines are marked `EDIT`.
+Full runbook (staging, per-node RDMA env, operate, watchdog): **[`8node-nvfp4/README.md`](8node-nvfp4/README.md)**.
 
-## Image build — required vLLM mods (not vendored)
+## Reproducibility — everything is here
 
-The `kernels/` here are the *implementations*. They do not wire themselves into
-vLLM: two patch steps that live in my
-[`eugr/spark-vllm-docker`](https://github.com/eugr/spark-vllm-docker) fork are
-required and are **not** vendored in this repo. Build the image at the pinned
-ref, then apply both mods (bake them with `RUN bash mods/<name>/run.sh`, as
-`Dockerfile.glm52-consolidated` does, or pass `--apply-mod mods/<name>` to
-`launch-cluster.sh`):
+The whole 8× runtime is in `8node-nvfp4/`: the launcher (`start_glm52_8node.sh`), the 3-config
+starter (`start_glm52_config.sh`), the base patches (`glm52-sparse-patches.sh`) + the DCP A/B/C
+patches (`glm52-dcp-patches.sh`), all Triton kernels (`kernels/`), the watchdog (`watchdog_glm52_cluster.sh`
++ `systemd/`), validators, the b12x wheel (`wheels/`), and the model-distribution helper (`scripts/`).
 
-- **`mods/glm52-sm12x-sparse`** — copies the `kernels/` files into the vLLM tree
-  and patches `vllm/utils/deep_gemm.py` + `sparse_attn_indexer.py` in place. On
-  capability family 120 it short-circuits `fp8_fp4_mqa_logits` /
-  `fp8_fp4_paged_mqa_logits` / `tf32_hc_prenorm_gemm` to the `sm12x_*` fallbacks
-  **before** the DeepGEMM `_missing()` gate, and rewrites the `SparseAttnIndexer`
-  constructor gate so sm_121 never requires `has_deep_gemm()`. There is **no
-  `deep_gemm` package shim** — the activation is this in-place wrapper patch.
-- **`mods/glm52-b12x-sparse`** — `pip install --no-deps b12x==0.23.0` plus a
-  `fused_indexer` score-mode patch. This provides the `b12x` package that the
-  sparse-MLA **decode** path (`b12x_sparse_helpers.py`) calls first.
+- **Base image** — the build recipe is vendored at `8node-nvfp4/image/spark-vllm-docker/` with
+  `image/BUILD-IMAGE.md` (exact command + the `--vllm-ref ab66606 --tf5` pins). All source build-deps
+  are forked + ref-pinned under `FHNW-Security-Lab-Dependencies` (vLLM `ab66606`, flashinfer `v0.6.13`,
+  NCCL `v2.30u1`, DeepGEMM `nv_dev`) for cluster-gone rebuilds.
+- **Binary deps** — image / NCCL shas + provenance in `8node-nvfp4/EXTERNAL-DEPS.md`; b12x wheel vendored.
+- **Not in git**: only the 465 GB weights (HF `nvidia/GLM-5.2-NVFP4`) — back them up off-cluster.
 
-**cudagraph note (important):** my perf numbers use `cudagraph_mode: FULL` *with
-b12x installed*. The b12x decode kernel is cudagraph-capture-safe. If b12x is
-absent, `_fp8_flash_mla_kernel` silently falls back to the Triton
-`flash_mla_with_kvcache` decode kernel, which does unconditional
-`torch.full(..., device=...)` allocations that are illegal under graph capture —
-so FULL capture crashes with `cudaErrorStreamCaptureInvalidated`. Without b12x,
-run `cudagraph_mode: PIECEWISE`. (The `b12x` import warning is `warning_once`, so
-it is emitted once during prefill warmup and then suppressed — decode falls back
-silently.)
+## Caveats
 
-`build-glm52-awq.sh` builds the base image at the pinned ref;
-`Dockerfile.glm52-consolidated` layers `glm52-sm12x-sparse` on top. Apply
-`glm52-b12x-sparse` the same way for the `-b12x` image the recipe expects.
+- **`prod` (non-DCP 512k) is the fast path** (~22.5 tok/s); DCP trades ~10–20% decode for >512k
+  context / ~8× the KV pool. Pick per workload.
+- **DCP prefill of very long prompts is slow** (the per-chunk-per-layer indexer all-gather): ~131k
+  prompts are practical, ~400k+ prefill is currently impractically slow — a known optimization target.
+  Decode speed and correctness are unaffected.
+- The DCP/1M path is **experimental**; gate any rollout on the long-context needle + a coherence soak.
 
-## Weights
+## Attribution / upstream
 
-- AWQ-INT4, 15%-pruned: https://huggingface.co/CosmicRaisins/GLM-5.2-AWQ-INT4-15pct
-- MTP draft: https://huggingface.co/CosmicRaisins/GLM-5.2-MTP-INT4-aligned
-
-`bootstrap.sh` pulls both.
-
-## Contents
-
-- `bootstrap.sh` — end-to-end bring-up (build → kernels → NCCL → weights → launch)
-- `launch.sh` — self-contained per-node `docker run` launcher (no Ray, no shared FS)
-- `kernels/` — portable Triton sparse-MLA (vLLM/jasl, Apache-2.0, modified — `CHANGES.md`)
-- `prune/awq_surgery.py` — the data-free 15% expert prune
-- `mtp/` — separate-draft MTP reconstruction
-- `recipes/` — the serving spec (flags + env; mirrored by `launch.sh`)
-- `model-card/` — HuggingFace card for the pruned weights
-- `docs/retrospective.md` — every fix, with attribution
-
-## Performance
-
-Measured on my 4× GB10 setup (TP=4, MTP k=3, llama-benchy generic corpus):
-
-| Depth | Decode (tg) | Prefill (pp) |
-|---|---|---|
-| 0   | 20.2 t/s | 535 t/s |
-| 8K  | 21.9 t/s | 517 t/s |
-| 32K | 21.2 t/s | 476 t/s |
-
-Numbers will vary with hardware and workload. In my tests decode is
-memory-bandwidth-bound and prefill is bound by the sparse-MLA / indexer kernels
-rather than the MoE GEMM (an NVFP4 MoE swap changed prefill by nothing) — but I
-haven't stress-tested that conclusion broadly.
-
-**MTP draft depth (k):** k=3 benchmarked best for me on a synthetic corpus, but
-Z.ai recommends k=5, and I haven't compared 3 vs 5 in real-world usage yet. The
-recipe ships k=3 — treat it as a starting point, not a settled answer.
-
-## License
-
-Apache-2.0 (this repo). Serves MIT weights: GLM-5.2 (Z.ai) → AWQ (cyankiwi) →
-pruned here. See `NOTICE` and `ATTRIBUTION.md`.
+Ported from [`CosmicRaisins/glm-5.2-gb10`](https://github.com/CosmicRaisins/glm-5.2-gb10) — proven on
+**4 nodes / TP=4 / AWQ-INT4 with a data-free 15% expert prune + a separate reconstructed INT4 MTP
+draft, at 256k**. **This fork runs the full NVFP4 model on 8 nodes (no prune)**, uses the
+**in-checkpoint** MTP draft the nvidia export ships, and extends context to **512k → 1M** with the
+sparse-aware context-parallel KV above. Builds on jasl's V4 sparse-MLA, the `eugr/spark-vllm-docker`
+image, and Z.ai's GLM-5.2. (The upstream 15% prune is coherence-checked, not benchmarked — not
+relevant here; this fork is unpruned.)
