@@ -91,5 +91,29 @@ the perf2 decode (dcp-512k inherits the gain). Rollback = repoint `PATCH_SCRIPT`
 beyond this would need the per-step compute (MoE/MLA/MTP in eager) addressed — cudagraph (hard
 on GB10) or MTP-k tuning (#3).
 
+## PERF#2-for-prefill — candidate-union prefill: **NO-GO** (boot-tested 2026-06-29)
+
+Ported the decode candidate-union to prefill (each rank runs the prefill logits + top-k over
+its LOCAL shard-K, fixed-size all-gathers candidates, unions → exact global top-2048). Full
+de-risking done (offline gate incl. localization formula GREEN; dry-run + py_compile;
+adversarial review GO-WITH-FIXES, fixes folded). Boot-tested at dcp-1m:
+- **Correct** — needle PASS at 32k / 131k / 256k; tiny-context guards held.
+- **Scales sublinearly** (1.61× time for 1.96× tokens) — the right direction vs item-C's superlinear.
+- **But +23% slower at 131k** (353 s vs item-C 287 s) and **wedges at 512k**.
+
+**Root cause (fundamental, not the union kernel):** the candidate all-gather moves
+`N × query-tokens × topk` per layer. Prefill has thousands of query rows per chunk (decode has
+1–4), so the candidate exchange is hundreds of GB of fabric traffic and dominates at
+low/moderate context; the per-chunk local-logits buffer (`context/8` wide) grows and collides
+with the reserved 1M KV pool at 512k (OOM-wedge). The `torch.topk`-union fix (vs the
+double-argsort) only saved ~6% (374 → 353 s) — confirming the bottleneck is the *exchange*, not
+the union. **The candidate-union transfers to decode (+12%, in production) but not to prefill.**
+
+Fails the "not slower at small context" bar → **production keeps item-C prefill.** Code on
+branch `glm52-prefill-port` for a future revisit (a true distributed top-k that avoids the full
+candidate all-gather; or context-routing to use it only for the 256k–~450k band where it beats
+item-C). The biggest *practical* long-context lever remains **prod-steering** (route <512k to
+the non-DCP `prod` path) from the roadmap — independent of this.
+
 ## Not started
 - #3 MTP k=3→5 A/B · #4 max-num-batched-tokens 4096→8192 · #5 MAX_LOGITS_MB.
