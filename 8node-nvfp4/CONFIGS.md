@@ -66,12 +66,14 @@ not completed before pivoting back to dcp-1m):**
   twice and reports cold-vs-warm TTFT + the `vllm:prefix_cache_hits_total` delta (PASS = hits jump
   ~prompt_tokens AND warm TTFT ≪ cold).
 
-These knobs cannot speed up `dcp-1m` (both are non-DCP-only). To make **dcp-1m** faster while keeping
-1M + 4 slots, the levers are **MTP k-sweep** (`NUM_SPECULATIVE_TOKENS=k`, lossless) and **DSA
-`index_topk` 2048→1024** (`HF_OVERRIDES` add `"index_topk":1024`; halves the PERF#2 all-gather
-`[rows,8×topk]` + selected-key compute; the DCP patch whitelists `topk_tokens ∈ {512,1024,2048}`).
-`index_topk` is the only quality-affecting lever — gate hard on long-context needle **recall**
-(NOT set-equality; the selected set deliberately changes). See `PERF-RESULTS.md`.
+These knobs cannot speed up `dcp-1m` (both are non-DCP-only). **To make `dcp-1m` faster (keeping 1M +
+4 slots) see [`DCP1M-FASTER-RESEARCH.md`](DCP1M-FASTER-RESEARCH.md)** (full 2026-06-29 study). Headlines:
+the **4 slots ARE the win** — measured aggregate **N=4 = 40.3 tok/s (2.13×** the 18.9 single-stream;
+`concurrent_decode.py`), already live for <256k traffic; extend to concurrent ≥256k by raising the proxy
+`VLLM_PROXY_LONG_CONTEXT_TOKENS`. Real per-token decode lever = **`num_experts_per_tok` 8→6** (+8–13%,
+recall-gated). Prefill lever = **`max-num-batched-tokens` 4096→8192/16384**. **CORRECTION:** `index_topk`
+2048→1024 is NOT a bandwidth lever (the indexer scans full shard-K before top-k) → only ~+2–5% with full
+1M-recall risk → cheap-maybe, not a headline.
 
 ## What makes the DCP configs work (sparse-aware context-parallel KV)
 

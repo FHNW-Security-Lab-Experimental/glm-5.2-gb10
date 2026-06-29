@@ -115,5 +115,19 @@ candidate all-gather; or context-routing to use it only for the 256k–~450k ban
 item-C). The biggest *practical* long-context lever remains **prod-steering** (route <512k to
 the non-DCP `prod` path) from the roadmap — independent of this.
 
-## Not started
+## dcp-1m faster (research 2026-06-29) — see `DCP1M-FASTER-RESEARCH.md`
+
+Deep code-grounded survey of how to speed up dcp-1m (keep 1M + 4 slots). Headlines:
+- **The 4 slots ARE the win.** Live batch curve (8k, decode-isolated, `concurrent_decode.py`):
+  **N=1 18.9 → N=2 28.8 (1.52×) → N=4 40.3 tok/s aggregate (2.13×)** — the engine amortizes the
+  61% MoE-weight read across concurrent streams. Already live for <256k; for concurrent ≥256k raise
+  the proxy `VLLM_PROXY_LONG_CONTEXT_TOKENS` (Amdahl-capped ~1.8× at true 1M by the 39% per-row indexer scan).
+- **Decode is bandwidth-bound:** MoE weights ~61% / indexer full-shard-K scan ~39% / selected-MLA+all-gather <0.5%.
+- **Kernel-verified correction:** `index_topk` 2048→1024 is NOT a bandwidth lever (the indexer scans the full
+  shard-K *before* top-k, `sm12x_mqa.py`) → ~+2–5% (compute) with full multi-fact 1M-recall risk → cheap-maybe.
+- Real per-token byte lever = **`num_experts_per_tok` 8→6** (+8–13% single-stream, recall-gated, off-distribution).
+- Prefill: **`max-num-batched-tokens` 4096→8192/16384** (cheap, cuts per-chunk all-gatherv rounds) > the effort-L
+  distributed-topk ring. NEW-dead: all-gather score quant (0.03% of bytes), sub-FP8 indexer-K (needs new sm_121 FP4 kernel).
+
+## Not started (legacy notes; superseded by the dcp-1m research above for the DCP path)
 - #3 MTP k=3→5 A/B · #4 max-num-batched-tokens 4096→8192 · #5 MAX_LOGITS_MB.
