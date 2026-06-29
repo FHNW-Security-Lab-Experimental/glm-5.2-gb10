@@ -270,6 +270,15 @@ create_container() {
     memcap=(--memory "$CONTAINER_MEM_LIMIT" --memory-swap "$CONTAINER_MEM_LIMIT")
   fi
 
+  # Optional NCCL transport tuning — env-overridable, DEFAULT OFF (= NCCL auto, no change).
+  # For the NCCL_PROTO=LL128 decode-latency trial. NCCL_PROTO is process-global, so it also
+  # hits the bandwidth-bound prefill all_gatherv + TP all-reduce — A/B BOTH decode and prefill.
+  local nccl_extra=()
+  [[ -n "${NCCL_PROTO:-}" ]] && nccl_extra+=(-e "NCCL_PROTO=${NCCL_PROTO}")
+  [[ -n "${NCCL_MIN_NCHANNELS:-}" ]] && nccl_extra+=(-e "NCCL_MIN_NCHANNELS=${NCCL_MIN_NCHANNELS}")
+  [[ -n "${NCCL_MAX_NCHANNELS:-}" ]] && nccl_extra+=(-e "NCCL_MAX_NCHANNELS=${NCCL_MAX_NCHANNELS}")
+  [[ -n "${CUDA_DEVICE_MAX_CONNECTIONS:-}" ]] && nccl_extra+=(-e "CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS}")
+
   # IB passthrough is REQUIRED: without --device /dev/infiniband + IPC_LOCK +
   # memlock=-1, NCCL silently drops to TCP (~12 vs 30+ tok/s). This (with NCCL
   # 2.30.4 LD_PRELOAD) is what avoids the prior TP GLOO warmup wedge.
@@ -327,6 +336,7 @@ create_container() {
     -e NCCL_CUMEM_ENABLE=0 \
     -e NCCL_IGNORE_CPU_AFFINITY=1 \
     -e NCCL_DEBUG=WARN \
+    "${nccl_extra[@]}" \
     -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
     "$IMAGE" \
     -lc 'sleep infinity' >/dev/null
@@ -476,7 +486,7 @@ for node in "${NODES[@]}"; do
   if [[ "$rank" == "0" ]]; then
     create_container "$host_ip" "$net_if" "$hca"
   else
-    remote "$mgmt" "IMAGE='$IMAGE' CONTAINER='$CONTAINER' RUNTIME_DIR='$RUNTIME_DIR' LOG_DIR='$LOG_DIR' MODEL_DIR='$MODEL_DIR' MODEL_HOST_PATH='$MODEL_HOST_PATH' KERNELS_DIR='$KERNELS_DIR' PATCH_SCRIPT='$PATCH_SCRIPT' NCCL_SO='$NCCL_SO' STOP_CONTAINERS='$STOP_CONTAINERS' CONTAINER_MEM_LIMIT='$CONTAINER_MEM_LIMIT' MLA='$MLA' OPS='$OPS' NCCL_SOCKET_IFNAME_LIST='$NCCL_SOCKET_IFNAME_LIST' NCCL_IB_HCA_LIST='$NCCL_IB_HCA_LIST' VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS='${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}' TORCH_CUDA_ARCH_LIST='${TORCH_CUDA_ARCH_LIST:-12.1a}' bash -s" < <(
+    remote "$mgmt" "IMAGE='$IMAGE' CONTAINER='$CONTAINER' RUNTIME_DIR='$RUNTIME_DIR' LOG_DIR='$LOG_DIR' MODEL_DIR='$MODEL_DIR' MODEL_HOST_PATH='$MODEL_HOST_PATH' KERNELS_DIR='$KERNELS_DIR' PATCH_SCRIPT='$PATCH_SCRIPT' NCCL_SO='$NCCL_SO' STOP_CONTAINERS='$STOP_CONTAINERS' CONTAINER_MEM_LIMIT='$CONTAINER_MEM_LIMIT' MLA='$MLA' OPS='$OPS' NCCL_SOCKET_IFNAME_LIST='$NCCL_SOCKET_IFNAME_LIST' NCCL_IB_HCA_LIST='$NCCL_IB_HCA_LIST' VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS='${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}' TORCH_CUDA_ARCH_LIST='${TORCH_CUDA_ARCH_LIST:-12.1a}' NCCL_PROTO='${NCCL_PROTO:-}' NCCL_MIN_NCHANNELS='${NCCL_MIN_NCHANNELS:-}' NCCL_MAX_NCHANNELS='${NCCL_MAX_NCHANNELS:-}' CUDA_DEVICE_MAX_CONNECTIONS='${CUDA_DEVICE_MAX_CONNECTIONS:-}' bash -s" < <(
       declare -f create_container
       printf 'create_container %q %q %q\n' "$host_ip" "$net_if" "$hca"
     )

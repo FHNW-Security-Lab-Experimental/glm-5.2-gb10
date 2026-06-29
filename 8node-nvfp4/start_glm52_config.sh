@@ -21,7 +21,9 @@ set -euo pipefail
 PROFILE="${1:-}"
 RT=/home/blacksheeep/vllm-glm52/runtime
 export CONFIRM_GLM52=YES
-export ENFORCE_EAGER=1
+# ENFORCE_EAGER env-overridable for the cudagraph-on-prod A/B (default 1 = eager, unchanged).
+# Set ENFORCE_EAGER=0 to let the launcher capture CUDA graphs (b12x-probed FULL/PIECEWISE).
+export ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.78}"
 
 case "$PROFILE" in
@@ -30,7 +32,9 @@ case "$PROFILE" in
     export PATCH_SCRIPT=$RT/glm52-sparse-patches.sh
     export MAX_MODEL_LEN=524288
     export MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
-    export EXTRA_VLLM_ARGS=""
+    # PROD_EXTRA_ARGS lets the prefix-caching A/B inject --enable-prefix-caching /
+    # --no-enable-prefix-caching without further edits (default empty = unchanged).
+    export EXTRA_VLLM_ARGS="${PROD_EXTRA_ARGS:-}"
     WATCHDOG=enable
     ;;
   dcp-512k)

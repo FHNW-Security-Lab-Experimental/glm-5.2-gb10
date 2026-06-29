@@ -27,13 +27,51 @@ with many slots + MTP, `--max-num-batched-tokens` (4096) can bottleneck concurre
 ```bash
 ~/vllm-glm52/runtime/start_glm52_config.sh prod        # non-DCP 512k (fastest, production)
 ~/vllm-glm52/runtime/start_glm52_config.sh dcp-512k    # DCP 512k
-~/vllm-glm52/runtime/start_glm52_config.sh dcp-1m      # DCP, true 1M context
+MAX_NUM_SEQS=4 ~/vllm-glm52/runtime/start_glm52_config.sh dcp-1m   # DCP, true 1M, 4 parallel slots
 ```
 
-Each stops the prior model containers, drops caches on all 8, applies the in-container patches,
-and serves OpenAI-compatible on `192.168.88.101:8000` as `glm-5.2-nvfp4`. First boot ~12–15 min
-(465 GB load). Validate coherence + a long-context needle before trusting it (sparse attention
-can corrupt silently — never gate on `/health` alone): `validate_dcp.py`.
+`dcp-1m` already defaults to `MAX_NUM_SEQS=4` (shown explicit above); the KV pool holds ~4.12× a
+full-1M context, so 4 concurrent 1M streams fit. This is the **current production target** (true 1M
++ 4 slots). Each command stops the prior model containers, drops caches on all 8, applies the
+in-container patches, and serves OpenAI-compatible on `192.168.88.101:8000` as `glm-5.2-nvfp4`.
+First boot ~12–15 min (465 GB load). Validate coherence + a long-context needle before trusting it
+(sparse attention can corrupt silently — never gate on `/health` alone): `validate_dcp.py`.
+
+## Speed knobs on the non-DCP `prod` path only (cudagraph + prefix caching)
+
+**Why `prod` is faster (~24 vs ~18.8 tok/s decode):** non-DCP has no per-step cross-rank work — no
+local-top-2048 all-gather / union / owned-mask / LSE-recombine, and KV is local (replicated, not
+sharded-then-gathered). The cost is the 512k cap (1M of replicated MLA KV overflows a 121 GiB node →
+1M *requires* DCP). Measured 2026-06-29, prod baseline (eager): **23.9 / 23.7 tok/s @4k (warm), 23.4
+@90k**; dcp-1m baseline ~18.8. Two further toggles exist **only** on this non-DCP path (both are
+env-overridable defaults in `start_glm52_config.sh`, so production behavior is unchanged unless set):
+
+| Knob | How | Effect | DCP? |
+|---|---|---|---|
+| **CUDA graphs** | `ENFORCE_EAGER=0 start_glm52_config.sh prod` | launcher drops `--enforce-eager`, captures graphs; the in-container b12x probe selects **FULL** (confirmed `GLM52_CUDAGRAPH_MODE=FULL` on the prod boot). Est. +2–6% decode (bandwidth-bound caps it; MTP already amortizes launch overhead). | **NO** — cudagraph is a confirmed NO-GO on DCP (DCP collectives + `NCCL_CUMEM_ENABLE=0`). |
+| **Prefix caching** | `PROD_EXTRA_ARGS="--enable-prefix-caching" start_glm52_config.sh prod` | adds the flag (default passes none → vLLM-v1 default). Targets agentic context reuse (re-prefill drops to delta-only). | **NO/ineffective** — on dcp-1m the metric showed **67,540 queries / 0 hits** (sharded KV ⇒ no block reuse). |
+
+**Validation status (honest — these were wired + baselined this session but the on-toggle runs were
+not completed before pivoting back to dcp-1m):**
+- **cudagraph capture + actual speedup: NOT yet measured.** The toggle works and FULL is available
+  per the b12x probe, but the captured run (Boot C) was not run. Capture allocates extra workspace on
+  top of util 0.78 → watch for OOM (the cluster has an all-8-node OOM-wedge history; power-cycle to
+  recover); if capture-OOMs, retry with `GPU_MEMORY_UTILIZATION=0.74`. Re-gate correctness after
+  capture: top-k **set-equality** + 16k/131k needle at temp=0, never `/health`.
+- **prefix-cache effectiveness on the non-DCP DSA/`fp8_ds_mla` backend: UNVALIDATED.** Boot A
+  confirmed `--no-enable-prefix-caching` is a clean no-op (cold≈warm TTFT, hits_delta=0 ✓); the
+  `--enable-prefix-caching` run (Boot B) was aborted before the test ran. The critic's open risk is
+  that vLLM auto-disables APC on the custom sparse-indexer backend (flag accepted, never hits). Probe
+  staged on the head: `python3 ~/measure_prefix_cache.py <approx_tokens>` — sends an identical prompt
+  twice and reports cold-vs-warm TTFT + the `vllm:prefix_cache_hits_total` delta (PASS = hits jump
+  ~prompt_tokens AND warm TTFT ≪ cold).
+
+These knobs cannot speed up `dcp-1m` (both are non-DCP-only). To make **dcp-1m** faster while keeping
+1M + 4 slots, the levers are **MTP k-sweep** (`NUM_SPECULATIVE_TOKENS=k`, lossless) and **DSA
+`index_topk` 2048→1024** (`HF_OVERRIDES` add `"index_topk":1024`; halves the PERF#2 all-gather
+`[rows,8×topk]` + selected-key compute; the DCP patch whitelists `topk_tokens ∈ {512,1024,2048}`).
+`index_topk` is the only quality-affecting lever — gate hard on long-context needle **recall**
+(NOT set-equality; the selected set deliberately changes). See `PERF-RESULTS.md`.
 
 ## What makes the DCP configs work (sparse-aware context-parallel KV)
 
