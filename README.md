@@ -99,9 +99,13 @@ curl -s http://192.168.88.101:8000/v1/models                 # served as glm-5.2
 # 3) validate (sparse attention can corrupt silently — never trust /health alone):
 8node-nvfp4/validate_dcp.py --base http://192.168.88.101:8000/v1 --model glm-5.2-nvfp4 \
   --needle-tokens 131072 --depths 0.1,0.5,0.9
+# 4) reproduce the 4-slot AGGREGATE throughput (dcp-1m amortizes MoE reads across streams):
+python3 8node-nvfp4/concurrent_decode.py 8000 600   # N=1 18.9 -> N=2 28.8 -> N=4 40.3 tok/s (2.13x)
 ```
 
 Full runbook (staging, per-node RDMA env, operate, watchdog): **[`8node-nvfp4/README.md`](8node-nvfp4/README.md)**.
+The 4-slot aggregate speedup (measured 2.13× at N=4) + all other dcp-1m levers:
+**[`8node-nvfp4/DCP1M-FASTER-RESEARCH.md`](8node-nvfp4/DCP1M-FASTER-RESEARCH.md)**.
 
 ## Reproducibility — everything is here
 

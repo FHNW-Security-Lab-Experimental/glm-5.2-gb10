@@ -163,6 +163,31 @@ The launcher stops the prior model containers incl. **`model-router`** (which ho
 attention can corrupt silently, so don't gate on `/health` 200 alone). Serves
 OpenAI-compatible on `192.168.88.101:8000` as `glm-5.2-nvfp4`.
 
+## Reproduce the 4-slot aggregate throughput
+
+dcp-1m runs `MAX_NUM_SEQS=4`; the dominant MoE expert-weight read amortizes across concurrently
+decoding streams, so the cluster's real throughput is **far above the single-stream number**.
+Measured 2026-06-29 (engine-direct on `:8000`, decode-isolated 8k ctx, `concurrent_decode.py`):
+
+| concurrency | aggregate tok/s | vs single-stream |
+|---|---|---|
+| N=1 | 18.9 | 1.0× |
+| N=2 | 28.8 | 1.52× |
+| N=4 | **40.3** | **2.13×** |
+
+```bash
+# 1) launch dcp-1m (true 1M context + 4 concurrent slots)
+MAX_NUM_SEQS=4 ~/vllm-glm52/runtime/start_glm52_config.sh dcp-1m
+# 2) fire N=1,2,4 concurrent identical decode streams; prints the aggregate curve
+python3 concurrent_decode.py 8000 600        # args: ctx_tokens, max_tokens
+```
+
+`concurrent_decode.py` hits the engine directly (it bypasses the keepalive proxy, which
+serializes ≥256k streams; for concurrent ≥256k *through the proxy* raise
+`VLLM_PROXY_LONG_CONTEXT_TOKENS`). At true 1M the aggregate is Amdahl-capped to ~1.8× (the
+per-row indexer scan does not amortize). Full analysis + the other dcp-1m levers (with
+experiments + gates) are in [`DCP1M-FASTER-RESEARCH.md`](DCP1M-FASTER-RESEARCH.md).
+
 ## Watchdog (safety net)
 
 `sparks-glm52-watchdog` (`watchdog_glm52_cluster.sh` + `systemd/sparks-glm52-watchdog.{service,timer}`,
