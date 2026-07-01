@@ -57,6 +57,12 @@ if [ "$n" -ge "$NEED" ]; then
     flock -n 9 || { log "restart lock held (manual/other restart in progress) — skip"; exit 0; }
     echo 0 > "$WEDGE_FILE"
     log "WEDGE CONFIRMED — relaunching $CONTAINER at util=$UTIL"
+    # FORENSICS FIRST: dump where every rank is stuck BEFORE we kill anything (the whole point — find the root
+    # cause of the hang). ~60s, timeout-bounded so it can never block the recovery.
+    if [ -x "$HOME/cyber-watchdog/capture_wedge_forensics.sh" ]; then
+      log "capturing wedge forensics (py-spy all 8 ranks) -> ~/cyber-watchdog/wedge-forensics/"
+      timeout 150 "$HOME/cyber-watchdog/capture_wedge_forensics.sh" "wedge-$(date +%Y%m%d-%H%M%S)" 2>&1 | tail -12 | while IFS= read -r l; do log "  $l"; done || log "forensics capture failed/timed out (continuing to restart)"
+    fi
     # stop PRODUCTION + disable its watchdog first — vllm-glm52 (62G/node) can't co-exist with cyber and was
     # the true wedge cause (the glm52 watchdog kept resurrecting it).
     sudo systemctl disable --now sparks-glm52-watchdog.timer >/dev/null 2>&1 || true
