@@ -40,16 +40,18 @@ frozen" wedge.) The CLAUDE.md rule is exactly this: *only the watchdog matching 
 Active-probe watchdog (`tools/watchdog_cyber_cluster.sh` + `tools/systemd/sparks-cyber-watchdog.{service,timer}`,
 every 2 min on the head). The existing death/stall watchdogs **miss this wedge** (they treat `running==0` as
 idle). This one fires a trivial generation probe; if it **times out while the generation counter is frozen**
-(a wedge, vs merely busy = counter moving), after **2 consecutive** detections it relaunches the cyber model at
-**util 0.72** (flock-guarded; warms the JIT after). Probe timeout is **200 s** so a cold-start Triton JIT
-(~3 min, "not a wedge") completes and resets instead of false-triggering. It is a **backstop, not the fix** —
-the util reduction is what should keep it from wedging at all.
+(a wedge, vs merely busy = counter moving), after **2 consecutive** detections it relaunches the cyber model —
+**stopping production + disabling `sparks-glm52-watchdog` first**, at **util 0.82** (the load floor; flock-guarded;
+warms the JIT after). Probe timeout is **200 s** so a cold-start Triton JIT (~3 min, "not a wedge") completes and
+resets instead of false-triggering. It is a **backstop, not the fix** — the real prevention is stopping production
++ disabling its watchdog (see *ACTUAL root cause* above); **no util change prevents the wedge** (and lowering util
+OOMs the load).
 
 ## Relaunch hygiene (a second OOM mode — load-time, not serve-time)
 Cycling relaunches too fast **OOMs the fresh load**: killing a container does not instantly reclaim its
 GPU/unified memory, so a new NVFP4 load started seconds later runs out of memory — rank 0 dies mid-load
 (`dmesg`: `NVRM: Out of memory [NV_ERR_NO_MEMORY]`), workers hang waiting, health never reaches 200. Seen
-2026-07-01 when superseding a 0.78 relaunch with 0.72 after only 3 s.
+2026-07-01 when rapidly superseding relaunches during the incident recovery.
 **Rule:** between stopping and relaunching, **wait for memory reclaim** (per-node unified memory back to
 ~2-5%) — don't rapid-cycle. `sparks-cyber-watchdog`'s restart now polls the head's memory down to <20%
 before reloading; do the same manually:
