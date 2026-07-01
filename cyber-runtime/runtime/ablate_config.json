@@ -1,0 +1,1 @@
+{"enabled": true, "direction_file": "/models/cyber/cyber_direction.pt", "alpha": 2.0, "layer": "auto", "class_name": "DeepseekV2DecoderLayer", "mode": "subspace", "n_dirs": 12, "gate_k": 1.0, "layer_lo": 25, "layer_hi": 70}

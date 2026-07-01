@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Sparks cyber active-probe wedge watchdog every 2 minutes
+
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=2min
+AccuracySec=5s
+Persistent=true
+Unit=sparks-cyber-watchdog.service
+
+[Install]
+WantedBy=timers.target

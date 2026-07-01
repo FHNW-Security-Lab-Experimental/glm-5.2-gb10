@@ -1,0 +1,16 @@
+[Unit]
+Description=Sparks glm-5.2-nvfp4-cyber ACTIVE-PROBE wedge watchdog
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=blacksheeep
+# Catches the GB10 collective/unified-memory WEDGE that the death/stall watchdogs miss: on a wedge the
+# engine keeps /health=200 and num_requests_running=0 (looks idle) while GPUs spin and generation is frozen.
+# This fires a trivial generation probe; if it TIMES OUT while the generation counter is FROZEN (not merely
+# busy), after 2 consecutive detections it relaunches glm-5.2-nvfp4-cyber at a SAFE util (0.74, below the 0.82
+# that wedged). Shares restart.lock (flock) with manual launches.
+ExecStart=/home/blacksheeep/cyber-watchdog/watchdog_cyber_cluster.sh
+# a wedge-triggered run does the full relaunch (~20-30 min load) + JIT warmup before returning
+TimeoutStartSec=2700
