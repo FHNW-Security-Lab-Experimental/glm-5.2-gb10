@@ -14,8 +14,11 @@ runtime ablation hook — i.e. it uses the exact base runtime documented in `../
 | file | what |
 |---|---|
 | `RUNTIME_BACKUP.md` | the **exact** live serve command + env + artifact sha256s + restore procedure (the full runtime backup) |
+| **`MARLIN-MOE-DEADLOCK-FIX.md`** | **the collective-hang root cause (`moe_wna16_marlin_gemm` deadlock) + the fix `CUDA_DEVICE_MAX_CONNECTIONS=1` — validated** |
 | `INCIDENT-2026-07-01.md` | postmortem: the freeze/OOMs were a **production/cyber memory conflict**, not util; full timeline + fix |
 | `WEDGE-PREVENTION.md` | GB10 unified-memory wedge/OOM operations — the real cause + the correct levers (not util) |
+| `tools/capture_wedge_forensics.sh` | py-spy-dumps all 8 ranks on a wedge (host-side; the rank not in a collective = the culprit) |
+| `tools/stress_repro.sh` | reproduce the collective hang under load + confirm a fix (sustained-freeze + 2-snapshot detection) |
 | `runtime/vllm-serve-command.txt` | the captured `vllm serve` argv |
 | `runtime/ablate_config.json` | the in-container ablation config (mode/alpha/n_dirs/layer band) read by the hook |
 | `runtime/glm52-sparse-patches-cyber.sh` | the combined in-container patch = base sparse patch + ablation arming |
