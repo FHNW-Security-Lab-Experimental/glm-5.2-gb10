@@ -30,11 +30,55 @@ WEDGE_FILE="$STATE/wedge-count"; LOCK="$STATE/restart.lock"
 
 log() { logger -t sparks-cyber-watchdog "$*" 2>/dev/null || true; echo "$(date -Is) $*"; }
 gen_counter() { curl -s --max-time 5 "$METRICS" 2>/dev/null | awk '/^vllm:generation_tokens_total/{print int($2)}' | head -1; }
+CRASH_FILE="$STATE/crash-count"
+# is the EngineCore process alive inside the container? (distinguishes a CRASH from a slow load/long prefill)
+engine_alive() { sudo docker exec "$CONTAINER" bash -lc 'pgrep -f "EngineCore" >/dev/null 2>&1' >/dev/null 2>&1 && echo 1 || echo 0; }
 
-# 1. Health gate: if the API is down (or restarting), this is NOT the wedge case — leave it (a death/restart
-#    is either the death-watchdog's job or an in-progress relaunch). Reset the wedge counter and exit.
+# shared restart — used by BOTH the crash path (EngineCore dead) and the wedge path (gen frozen).
+do_restart() {
+  local reason="$1"
+  (
+    flock -n 9 || { log "restart lock held (manual/other restart in progress) — skip"; exit 0; }
+    echo 0 > "$WEDGE_FILE"; echo 0 > "$CRASH_FILE"
+    log "$reason CONFIRMED — relaunching $CONTAINER (profile=$PROFILE util=$UTIL)"
+    # forensics only makes sense for a WEDGE (ranks stuck-alive); a CRASH already has the traceback in the log
+    if [ "$reason" = "WEDGE" ] && [ -x "$HOME/cyber-watchdog/capture_wedge_forensics.sh" ]; then
+      log "capturing wedge forensics (py-spy all 8 ranks) -> ~/cyber-watchdog/wedge-forensics/"
+      timeout 150 "$HOME/cyber-watchdog/capture_wedge_forensics.sh" "wedge-$(date +%Y%m%d-%H%M%S)" 2>&1 | tail -12 | while IFS= read -r l; do log "  $l"; done || log "forensics capture failed/timed out (continuing)"
+    fi
+    sudo systemctl disable --now sparks-glm52-watchdog.timer >/dev/null 2>&1 || true
+    sudo docker rm -f "$CONTAINER" vllm-glm52 >/dev/null 2>&1 || true
+    for h in 192.168.88.{102..108}; do ssh -o ConnectTimeout=8 "$h" "sudo docker rm -f $CONTAINER vllm-glm52 >/dev/null 2>&1" 2>/dev/null || true; done
+    for i in $(seq 1 20); do
+      used="$(free -m | awk '/Mem:/{print int($3*100/$2)}')"
+      log "waiting for memory reclaim: head=${used:-?}%"
+      [ "${used:-100}" -lt 20 ] && break
+      sleep 5
+    done
+    sleep 5
+    CONFIRM_CYBER=YES GPU_MEMORY_UTILIZATION="$UTIL" bash "$LAUNCH" "$PROFILE" > /home/blacksheeep/glm52-cyber-launch.log 2>&1
+    for i in $(seq 1 130); do [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "$HEALTH" 2>/dev/null)" = "200" ] && break; sleep 15; done
+    curl -s -o /dev/null --max-time 240 "$GEN" -H 'Content-Type: application/json' \
+      -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"warmup\"}],\"max_tokens\":8,\"temperature\":0,\"chat_template_kwargs\":{\"enable_thinking\":false}}" 2>/dev/null || true
+    log "relaunch complete + JIT warmed"
+  ) 9>"$LOCK"
+}
+
+# 1. Health gate. If not serving: distinguish a CRASH (EngineCore process gone -> restart) from a slow load /
+#    long prefill / in-progress relaunch (EngineCore alive -> leave it). This is the fix for the 2026-07-02
+#    cuBLAS crash that left the model down for hours because the old gate just skipped on health!=200.
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "$HEALTH" 2>/dev/null || true)"
-if [ "$code" != "200" ]; then echo 0 > "$WEDGE_FILE"; log "health=$code (not the wedge case) — skip"; exit 0; fi
+if [ "$code" != "200" ]; then
+  if [ "$(engine_alive)" = "0" ]; then
+    n=$(( $(cat "$CRASH_FILE" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$CRASH_FILE"
+    log "CRASH suspected: health=$code, EngineCore process GONE, count=$n/$NEED"
+    [ "$n" -ge "$NEED" ] && do_restart "CRASH"
+  else
+    echo 0 > "$CRASH_FILE"; log "health=$code but EngineCore alive (slow load / long prefill) — skip"
+  fi
+  echo 0 > "$WEDGE_FILE"; exit 0
+fi
+echo 0 > "$CRASH_FILE"   # healthy -> reset the crash counter
 
 # 2. Active probe: a trivial generation. Note the generation counter before/after.
 gen1="$(gen_counter)"
@@ -52,36 +96,4 @@ fi
 # 4. Probe failed AND generation frozen = WEDGE. Count consecutive; restart at NEED.
 n=$(( $(cat "$WEDGE_FILE" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$WEDGE_FILE"
 log "WEDGE suspected: probe=$pc, gen frozen (${gen1:-?}==${gen2:-?}), count=$n/$NEED"
-if [ "$n" -ge "$NEED" ]; then
-  (
-    flock -n 9 || { log "restart lock held (manual/other restart in progress) — skip"; exit 0; }
-    echo 0 > "$WEDGE_FILE"
-    log "WEDGE CONFIRMED — relaunching $CONTAINER at util=$UTIL"
-    # FORENSICS FIRST: dump where every rank is stuck BEFORE we kill anything (the whole point — find the root
-    # cause of the hang). ~60s, timeout-bounded so it can never block the recovery.
-    if [ -x "$HOME/cyber-watchdog/capture_wedge_forensics.sh" ]; then
-      log "capturing wedge forensics (py-spy all 8 ranks) -> ~/cyber-watchdog/wedge-forensics/"
-      timeout 150 "$HOME/cyber-watchdog/capture_wedge_forensics.sh" "wedge-$(date +%Y%m%d-%H%M%S)" 2>&1 | tail -12 | while IFS= read -r l; do log "  $l"; done || log "forensics capture failed/timed out (continuing to restart)"
-    fi
-    # stop PRODUCTION + disable its watchdog first — vllm-glm52 (62G/node) can't co-exist with cyber and was
-    # the true wedge cause (the glm52 watchdog kept resurrecting it).
-    sudo systemctl disable --now sparks-glm52-watchdog.timer >/dev/null 2>&1 || true
-    sudo docker rm -f "$CONTAINER" vllm-glm52 >/dev/null 2>&1 || true
-    for h in 192.168.88.{102..108}; do ssh -o ConnectTimeout=8 "$h" "sudo docker rm -f $CONTAINER vllm-glm52 >/dev/null 2>&1" 2>/dev/null || true; done
-    # WAIT for GPU/unified memory to be reclaimed before reloading — a fresh NVFP4 load on stale memory OOMs
-    # (rank 0 dies mid-load, NVRM Out of memory). Poll the head's unified memory down to <20% (or ~100s max).
-    for i in $(seq 1 20); do
-      used="$(free -m | awk '/Mem:/{print int($3*100/$2)}')"
-      log "waiting for memory reclaim: head=${used:-?}%"
-      [ "${used:-100}" -lt 20 ] && break
-      sleep 5
-    done
-    sleep 5
-    CONFIRM_CYBER=YES GPU_MEMORY_UTILIZATION="$UTIL" bash "$LAUNCH" "$PROFILE" > /home/blacksheeep/glm52-cyber-launch.log 2>&1
-    # wait for health, then WARM the Triton JIT so the next watchdog probe isn't a false positive
-    for i in $(seq 1 130); do [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "$HEALTH" 2>/dev/null)" = "200" ] && break; sleep 15; done
-    curl -s -o /dev/null --max-time 240 "$GEN" -H 'Content-Type: application/json' \
-      -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"warmup\"}],\"max_tokens\":8,\"temperature\":0,\"chat_template_kwargs\":{\"enable_thinking\":false}}" 2>/dev/null || true
-    log "relaunch complete + JIT warmed"
-  ) 9>"$LOCK"
-fi
+[ "$n" -ge "$NEED" ] && do_restart "WEDGE"
