@@ -33,9 +33,15 @@ all 8 nodes (`launch.sh` line ~280 local + ~489 remote). **Baked into `05_launch
 so `start_cyber.sh`, direct `05`, and the watchdog's restart all inherit it. **Keeps MTP + 4 slots + 1M + eager.**
 
 ## Validation (before/after, same load)
-| | baseline (no fix) | `CUDA_DEVICE_MAX_CONNECTIONS=1` |
+| config | baseline (no fix) | `CUDA_DEVICE_MAX_CONNECTIONS=1` |
 |---|---|---|
-| 4-concurrent realistic stress | **permanent deadlock** in ~80s (2-snapshot: all 8 ranks stuck in Marlin/GEMM; needed a restart) | **22 min clean** — gen counter climbed 7,234→118,467 (~5k tok/min), never froze, probes all 200 |
+| 512k + 4 slots | **permanent deadlock** in ~80s (2-snapshot: all 8 ranks stuck in Marlin/GEMM; needed a restart) | **22 min clean** — gen 7,234→118,467, never froze, probes all 200 |
+| **1M + 3 slots** (dcp-1m) | — | ✅ 20 min clean (frozen=0/9) |
+| **1M + 4 slots** (dcp-1m) | — | ✅ 20 min clean + **extended battery ALL-PASS 2026-07-02**: 40-min soak + ~400k-ctx memory push (no dead rank) + rapid churn |
+
+**Standing production config = `dcp-1m` (1M context + 4 slots + CDMC=1)** — `start_cyber.sh` (no-arg) and the
+watchdog now default to it, so restarts keep 1M. Live serve argv: `runtime/vllm-serve-command-dcp1m.txt`. Use
+`start_cyber.sh prod` for the faster 512k config (~22.5 vs ~18-19 tok/s at 1M).
 
 Re-validate any time: `LABEL=x CONC=4 DURATION=1800 ~/cyber-watchdog/stress_repro.sh` (declares a wedge only on a
 sustained 3-min freeze confirmed by 2-snapshot — no false positives from prefill saturation).

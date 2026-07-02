@@ -18,7 +18,7 @@ GEN="http://127.0.0.1:8000/v1/chat/completions"
 MODEL="${CYBER_MODEL:-glm-5.2-nvfp4-cyber}"
 CONTAINER="${CYBER_CONTAINER:-vllm-glm52-cyber}"
 LAUNCH="${CYBER_LAUNCH:-/home/blacksheeep/glm52-cyber-ablation/scripts/05_launch_cyber_model.sh}"
-PROFILE="${CYBER_PROFILE:-prod}"
+PROFILE="${CYBER_PROFILE:-dcp-1m}"   # standing prod config = 1M + 4 slots (validated 2026-07-02); a restart keeps 1M
 UTIL="${CYBER_UTIL:-0.82}"                     # 0.82 is the LOAD floor (0.72 OOMs the load); the wedge was a
                                                # production conflict, not util — see below.
 # 200s so a COLD-START JIT (~3 min Triton compile on the first request, "not a wedge") completes within the

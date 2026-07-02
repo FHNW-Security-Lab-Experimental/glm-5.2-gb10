@@ -31,7 +31,7 @@ SNIPPET='def handler(req):
     if verify(token): return admin_panel(user)
     return login()
 '
-LONGCTX=""; for _ in $(seq 1 350); do LONGCTX+="$SNIPPET"; done   # ~20k tokens of structured code
+LONGCTX=""; for _ in $(seq 1 "${CTX_REPS:-350}"); do LONGCTX+="$SNIPPET"; done   # ~20k tok default; CTX_REPS=2500 ~= 150k tok (for 1M memory stress)
 
 fire() {
   local id="$1" i=0
